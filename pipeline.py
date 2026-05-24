@@ -19,6 +19,7 @@ Output (result) fields:
 import os
 import json
 import logging
+import time
 from typing import List, Dict, Any, Optional
 
 # Import your agents here.
@@ -30,6 +31,7 @@ from agents.vector_store import VectorStore
 from agents.vector_retriever import Retriever
 from agents.RAG_synthesis import RAGAgent
 from agents.hypothesis import HypothesisAgent
+from agents.cache import SQLiteCache
 
 # Configure logger
 logging.basicConfig(level=logging.INFO)
@@ -46,8 +48,8 @@ class Pipeline:
         extracted_path: str = "outputs/extracted_text.txt",
         embedding_dim: int = 384,
         faiss_top_k: int = 3,
-        rag_model: str = "openai/gpt-oss-20b",
-        hypo_model: str = "openai/gpt-oss-20b",
+        rag_model: str = "llama-3.1-8b-instant",
+        hypo_model: str = "llama-3.3-70b-versatile",
     ):
         self.outputs_dir = outputs_dir
         os.makedirs(outputs_dir, exist_ok=True)
@@ -58,6 +60,7 @@ class Pipeline:
         self.chunks_path = chunks_path
         self.cleaned_path = cleaned_path
         self.extracted_path = extracted_path
+        self.metadata_path = os.path.join(outputs_dir, "chunks_metadata.json")
 
         # components
         self.pdf_extractor = PDFExtractionAgent()
@@ -69,6 +72,7 @@ class Pipeline:
         self.hypo_agent = HypothesisAgent(model=hypo_model)
         self.embedding_dim = embedding_dim
         self.faiss_top_k = faiss_top_k
+        self.cache = SQLiteCache()
 
     # --------------------
     # Utilities
@@ -102,16 +106,26 @@ class Pipeline:
         return raw_text
 
     def clean_and_chunk(self, raw_text: str, chunk_size: int = 300) -> List[str]:
-        """Clean extracted text and create chunks. Save cleaned and chunks files."""
-        logger.info("Cleaning text and chunking (chunk size=%d)", chunk_size)
+        """Clean extracted text and create chunks. Save cleaned, chunks, and metadata files."""
+        logger.info("Cleaning text and chunking with page metadata (chunk size=%d)", chunk_size)
+        
+        chunks_with_meta = self.cleaner.clean_and_chunk_with_metadata(raw_text, chunk_size=chunk_size)
+        chunks = [c["text"] for c in chunks_with_meta]
+        metadata = [c["metadata"] for c in chunks_with_meta]
+
         cleaned = self.cleaner.clean_text(raw_text)
         self._save_text(cleaned, self.cleaned_path)
 
-        chunks = self.cleaner.chunk_text(cleaned, chunk_size=chunk_size)
         # save with separator so loaders can parse
         with open(self.chunks_path, "w", encoding="utf-8") as f:
             f.write("\n---\n".join(chunks))
         logger.info("Saved %d chunks to %s", len(chunks), self.chunks_path)
+
+        # save metadata JSON file
+        with open(self.metadata_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
+        logger.info("Saved chunks metadata to %s", self.metadata_path)
+
         return chunks
 
     def embed_and_index(self, chunks: List[str], force_reindex: bool = False) -> Any:
@@ -155,15 +169,22 @@ class Pipeline:
     def prepare_retriever(self, chunks: List[str]):
         """Instantiate retriever (requires vector_store + chunks + embedder)."""
         logger.info("Preparing retriever with %d chunks", len(chunks))
-        self.retriever = Retriever(self.vector_store, chunks, self.embedder)
+        metadata = None
+        if os.path.exists(self.metadata_path):
+            try:
+                with open(self.metadata_path, "r", encoding="utf-8") as f:
+                    metadata = json.load(f)
+            except Exception as e:
+                logger.warning("Failed to load chunks metadata: %s", e)
+        self.retriever = Retriever(self.vector_store, chunks, self.embedder, metadata=metadata)
 
-    def retrieve(self, query: str, top_k: Optional[int] = None) -> List[str]:
+    def retrieve(self, query: str, top_k: Optional[int] = None, filter_dict: Optional[dict] = None) -> List[str]:
         """Return top-k relevant chunks for query (list of strings)."""
         if self.retriever is None:
             raise RuntimeError("Retriever not prepared. Call prepare_retriever() first.")
         k = top_k or self.faiss_top_k
-        logger.info("Retrieving top %d chunks for query.", k)
-        return self.retriever.retrieve(query, top_k=k)
+        logger.info("Retrieving top %d chunks for query. Filters: %s", k, filter_dict)
+        return self.retriever.retrieve(query, top_k=k, filter_dict=filter_dict)
 
     def generate_answer(self, query: str, retrieved_chunks: List[str]) -> str:
         """Use RAG agent to generate final answer."""
@@ -186,54 +207,115 @@ class Pipeline:
         chunk_size: int = 300,
         top_k: int = 3,
         force_reindex: bool = False,
+        use_cache: bool = True,
+        filter_dict: Optional[dict] = None,
     ) -> Dict[str, Any]:
         """
         Full end-to-end run:
          - Extract -> Clean/Chunk -> Embed/Index -> Retrieve -> RAG -> Hypotheses
-        Returns a dictionary with answer, retrieved chunks, hypotheses, and saved paths.
+        Returns a dictionary with answer, retrieved chunks, hypotheses, metrics, and saved paths.
         """
+        t_pipeline_start = time.perf_counter()
+
+        # Check Response Cache
+        if use_cache:
+            cached_res = self.cache.get_pipeline_response(
+                pdf_path, query, 
+                topic_for_hypotheses=topic_for_hypotheses, 
+                chunk_size=chunk_size, 
+                top_k=top_k, 
+                filter_dict=filter_dict
+            )
+            if cached_res:
+                duration = time.perf_counter() - t_pipeline_start
+                logger.info(json.dumps({
+                    "metric": "pipeline_cache_hit",
+                    "pdf_path": pdf_path,
+                    "duration_sec": round(duration, 4)
+                }))
+                return cached_res
+
         logger.info("Starting pipeline for PDF: %s", pdf_path)
+        metrics = {}
 
         # 1. Extract
+        t_start = time.perf_counter()
         raw_text = self.extract_pdf(pdf_path)
+        metrics["extraction_sec"] = round(time.perf_counter() - t_start, 4)
 
         # 2. Clean + Chunk
+        t_start = time.perf_counter()
         chunks = self.clean_and_chunk(raw_text, chunk_size=chunk_size)
+        metrics["clean_chunk_sec"] = round(time.perf_counter() - t_start, 4)
 
         # 3. Embedding + Indexing
+        t_start = time.perf_counter()
         embeddings = self.embed_and_index(chunks, force_reindex=force_reindex)
+        metrics["embed_index_sec"] = round(time.perf_counter() - t_start, 4)
 
         # 4. Prepare retriever
+        t_start = time.perf_counter()
         self.prepare_retriever(chunks)
+        metrics["prepare_retriever_sec"] = round(time.perf_counter() - t_start, 4)
 
         # 5. Retrieve
-        retrieved_chunks = self.retrieve(query, top_k=top_k)
+        t_start = time.perf_counter()
+        retrieved_chunks = self.retrieve(query, top_k=top_k, filter_dict=filter_dict)
+        metrics["retrieve_sec"] = round(time.perf_counter() - t_start, 4)
 
         # 6. Answer (RAG)
+        t_start = time.perf_counter()
         answer = self.generate_answer(query, retrieved_chunks)
+        metrics["rag_synthesis_sec"] = round(time.perf_counter() - t_start, 4)
 
         # 7. Hypotheses (optional)
+        t_start = time.perf_counter()
         topic = topic_for_hypotheses or query
         hypotheses = self.generate_hypotheses(topic, retrieved_chunks, max_hypotheses=3)
+        metrics["hypothesis_generation_sec"] = round(time.perf_counter() - t_start, 4)
+
+        duration = time.perf_counter() - t_pipeline_start
+        metrics["pipeline_total_sec"] = round(duration, 4)
 
         # 8. Save a JSON result summary
         result = {
             "answer": answer,
             "retrieved_chunks": retrieved_chunks,
             "hypotheses": hypotheses,
+            "metrics": metrics,
             "paths": {
                 "extracted": os.path.abspath(self.extracted_path),
                 "cleaned": os.path.abspath(self.cleaned_path),
                 "chunks": os.path.abspath(self.chunks_path),
+                "metadata": os.path.abspath(self.metadata_path),
                 "embeddings": os.path.abspath(self.embeddings_path),
                 "faiss_index": os.path.abspath(self.faiss_index_path),
             }
         }
 
+        # Log total pipeline metrics
+        logger.info(json.dumps({
+            "metric": "pipeline_complete",
+            "pdf_path": pdf_path,
+            "total_duration_sec": metrics["pipeline_total_sec"],
+            "steps": metrics
+        }))
+
+        # Save to summary
         summary_path = os.path.join(self.outputs_dir, "last_run_summary.json")
         with open(summary_path, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
         logger.info("Saved pipeline summary to %s", summary_path)
+
+        # Cache response
+        if use_cache:
+            self.cache.set_pipeline_response(
+                pdf_path, query, result,
+                topic_for_hypotheses=topic_for_hypotheses, 
+                chunk_size=chunk_size, 
+                top_k=top_k, 
+                filter_dict=filter_dict
+            )
 
         return result
 
@@ -251,9 +333,14 @@ if __name__ == "__main__":
     parser.add_argument("--chunk-size", type=int, default=300, help="Chunk size (words)")
     parser.add_argument("--top-k", type=int, default=3, help="Top-k chunks to retrieve")
     parser.add_argument("--force-reindex", action="store_true", help="Force recomputing embeddings and reindexing")
+    parser.add_argument("--page", type=int, default=None, help="Filter search to a specific page number")
+    parser.add_argument("--no-cache", action="store_true", help="Disable response cache lookup")
     args = parser.parse_args()
 
     pipeline = Pipeline()
+    
+    filter_dict = {"page": args.page} if args.page else None
+    
     out = pipeline.process_pdf_and_answer(
         args.pdf,
         args.query,
@@ -261,9 +348,13 @@ if __name__ == "__main__":
         chunk_size=args.chunk_size,
         top_k=args.top_k,
         force_reindex=args.force_reindex,
+        use_cache=not args.no_cache,
+        filter_dict=filter_dict
     )
 
     print("\n=== FINAL ANSWER ===\n")
     print(out["answer"])
     print("\n=== HYPOTHESES ===\n")
     print(json.dumps(out["hypotheses"], indent=2, ensure_ascii=False))
+    print("\n=== METRICS ===\n")
+    print(json.dumps(out.get("metrics", {}), indent=2))

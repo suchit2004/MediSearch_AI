@@ -1,22 +1,32 @@
 import os
 import json
+import time
+import logging
 from groq import Groq
 from typing import List, Dict, Any
 
 from dotenv import load_dotenv
-load_dotenv()
+from pathlib import Path
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("HypothesisAgent")
+
+load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env", override=True)
 class HypothesisAgent:
     """
     Generates testable hypotheses from retrieved chunks using Groq LLMs.
     Returns parsed JSON (list of hypothesis dicts) when possible.
     """
 
-    def __init__(self, model: str = "openai/gpt-oss-20b", temperature: float = 0.2):
+    def __init__(self, model: str = "llama-3.3-70b-versatile", temperature: float = 0.2):
         """
         model: Groq model to use
         temperature: lower -> more conservative / factual outputs
         """
-        self.client = Groq(api_key= os.getenv("GROQ_API_KEY"))  
+        api_key = os.getenv("GROQ_API_KEY")
+        if api_key:
+            api_key = api_key.strip()
+        self.client = Groq(api_key=api_key)  
         self.model = model
         self.temperature = temperature
 
@@ -61,12 +71,27 @@ Output ONLY the JSON array.
         """
         prompt = self._build_prompt(topic, retrieved_chunks, max_hypotheses=max_hypotheses)
 
+        t0 = time.perf_counter()
         resp = self.client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
             temperature=self.temperature,
             max_tokens=1024
         )
+        duration = time.perf_counter() - t0
+
+        usage = getattr(resp, "usage", None)
+        prompt_tokens = usage.prompt_tokens if usage else 0
+        completion_tokens = usage.completion_tokens if usage else 0
+
+        logger.info(json.dumps({
+            "metric": "groq_api_call",
+            "agent": "HypothesisAgent",
+            "model": self.model,
+            "duration_sec": round(duration, 4),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens
+        }))
 
         # Groq returns message object; access .content
         text = resp.choices[0].message.content

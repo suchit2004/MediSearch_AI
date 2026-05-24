@@ -9,7 +9,7 @@ def load_chunks(path="outputs/cleaned_text.txt", separator="---"):
 chunks = load_chunks("outputs/cleaned_text.txt")  # or outputs/cleaned_text.txt depending on your format
 topic = "The risk analysis of unplanned tracheal intubation after radical esophagectomy"
 
-agent = HypothesisAgent(model="openai/gpt-oss-20b", temperature=0.2)
+agent = HypothesisAgent(model="llama-3.3-70b-versatile", temperature=0.2)
 hypotheses = agent.generate(topic, chunks[:8], max_hypotheses=3)  # send top N chunks or FAISS-retrieved chunks
 
 print("Generated hypotheses:")

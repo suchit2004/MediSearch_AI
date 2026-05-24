@@ -2,3 +2,9 @@
 venv
 **/*__pycache__
 **/*DS_Store
+temp_uploaded.pdf
+outputs/*.db
+outputs/*.index
+outputs/*.npy
+outputs/*.txt
+outputs/*.json

@@ -17,7 +17,7 @@ retrieved_chunks = chunks[:3]
 query = "What does the research say about esophagectomy treatment options?"
 
 # Initialize RAG agent with Groq model
-rag = RAGAgent(model="openai/gpt-oss-20b")
+rag = RAGAgent(model="llama-3.1-8b-instant")
 
 print("Testing Groq RAG Agent with REAL CHUNKS...\n")
 

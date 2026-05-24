@@ -1,15 +1,24 @@
 import os
+import json
+import time
+import logging
 from groq import Groq
-
 from dotenv import load_dotenv
-load_dotenv()
+from pathlib import Path
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("RAGAgent")
 
-# Load API key safely from environment variables
+load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env", override=True)
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+if GROQ_API_KEY:
+    GROQ_API_KEY = GROQ_API_KEY.strip()
+else:
+    raise ValueError("GROQ_API_KEY not found. Check your .env file.")
 
-if not GROQ_API_KEY:
-    raise ValueError(" GROQ_API_KEY not found. Please set it as an environment variable.")
+print("Loaded Key:", GROQ_API_KEY)
+print("Length:", len(GROQ_API_KEY) if GROQ_API_KEY else 0)
 
 class RAGAgent:
     """
@@ -44,10 +53,25 @@ EVIDENCE-BASED ANSWER:
 """
 
         # Generate the answer
+        t0 = time.perf_counter()
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
         )
+        duration = time.perf_counter() - t0
+        
+        usage = getattr(response, "usage", None)
+        prompt_tokens = usage.prompt_tokens if usage else 0
+        completion_tokens = usage.completion_tokens if usage else 0
+        
+        logger.info(json.dumps({
+            "metric": "groq_api_call",
+            "agent": "RAGAgent",
+            "model": self.model,
+            "duration_sec": round(duration, 4),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens
+        }))
 
         return response.choices[0].message.content
